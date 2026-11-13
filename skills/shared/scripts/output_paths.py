@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single source of truth for Easel output paths."""
+"""Single source of truth for xh output paths."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ def _discover_root() -> Path:
         if outputs.exists():
             # The OpenClaw workspace exposes outputs as a symlink to the project.
             return outputs.resolve().parent
-    raise RuntimeError("找不到 Easel 项目根；请设置 EASEL_ROOT")
+    raise RuntimeError("找不到 xh 项目根；请设置 EASEL_ROOT")
 
 
 PROJECT_ROOT = _discover_root()
@@ -41,7 +41,7 @@ SYSTEM_FILES = {"_ideas.json", "_publish.log", "_schedule.json"}
 
 
 class OutputPathError(ValueError):
-    """Raised when a path violates the Easel outputs layout."""
+    """Raised when a path violates the xh outputs layout."""
 
 
 def validate_output_path(
@@ -91,7 +91,7 @@ def validate_project_dir(value: str | os.PathLike[str], *, create: bool = False)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="校验 Easel outputs 路径规约")
+    parser = argparse.ArgumentParser(description="校验 xh outputs 路径规约")
     parser.add_argument("path")
     parser.add_argument("--system", action="store_true", help="允许已注册的系统路径")
     args = parser.parse_args()

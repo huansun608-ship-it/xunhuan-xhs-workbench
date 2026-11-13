@@ -9,6 +9,7 @@ import ArtifactGallery from './ArtifactGallery';
 export interface BubbleActions {
   onCopy: () => void;
   onRetry?: () => void;    // 仅最后一轮可用（append-only：不改写历史）
+  onPreparePublish?: () => void;
   canModify: boolean;      // 流式中禁用 retry
 }
 
@@ -35,6 +36,9 @@ function ActionBar({ actions }: { actions: BubbleActions }) {
       </button>
       {actions.onRetry && actions.canModify && (
         <button className="msg-action" onClick={actions.onRetry} title="重新生成"><IconRetry size={14} /><span>重试</span></button>
+      )}
+      {actions.onPreparePublish && actions.canModify && (
+        <button className="msg-action" onClick={actions.onPreparePublish}>带到发布中心</button>
       )}
     </div>
   );

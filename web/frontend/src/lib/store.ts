@@ -36,6 +36,7 @@ export interface PublishDraft {
   platforms: string[];
   overrides: Record<string, string>;
   tags: string;   // 话题标签，逗号分隔（小红书绑话题；其它平台按需写入）
+  selectedMedia?: string[];
 }
 const PUBLISH_KEY = 'easel_publish_draft';
 const PREVIOUS_BRAND = ['post', 'craft'].join('');
@@ -55,17 +56,21 @@ function readMigratedLocalValue(key: string, suffix: string): string | null {
 const PUBLISH_DEFAULT: PublishDraft = {
   title: '', body: '', platforms: ['xiaohongshu', 'douyin'], overrides: {}, tags: '',
 };
-export function loadPublishDraft(): PublishDraft {
+function publishDraftKey(persona = ''): string {
+  return persona ? `${PUBLISH_KEY}:${encodeURIComponent(persona)}` : PUBLISH_KEY;
+}
+
+export function loadPublishDraft(persona = ''): PublishDraft {
   try {
-    const raw = readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
+    const raw = persona ? localStorage.getItem(publishDraftKey(persona)) : readMigratedLocalValue(PUBLISH_KEY, 'publish_draft');
     if (!raw) return { ...PUBLISH_DEFAULT };
     return { ...PUBLISH_DEFAULT, ...(JSON.parse(raw) as PublishDraft) };
   } catch {
     return { ...PUBLISH_DEFAULT };
   }
 }
-export function savePublishDraft(d: PublishDraft): void {
-  try { localStorage.setItem(PUBLISH_KEY, JSON.stringify(d)); } catch { /* quota */ }
+export function savePublishDraft(d: PublishDraft, persona = ''): void {
+  try { localStorage.setItem(publishDraftKey(persona), JSON.stringify(d)); } catch { /* quota */ }
 }
 
 const STORAGE_KEY = 'easel_sessions';

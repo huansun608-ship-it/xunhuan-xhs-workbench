@@ -6,6 +6,8 @@
 
 - 保留 Easel 的本地 Web 工作台与技能系统。
 - 工作台名称及界面配色已定制；保险内容优先路由已配置。
+- 已同步 2026-11-13 工作台更新：xh 界面、保险参考内容、小红书笔记读取、按画像保存发布草稿和素材、对话稿件交接，以及本机浏览器草稿扩展。
+- 小红书操作仅保存平台草稿；扩展安装说明见 [browser-extension/README.md](browser-extension/README.md)，公开发布仍由用户在官方页面完成。
 - 仓库内保险技能已整合为 [insurance-xhs v1.4.2](docs/insurance-xhs.md)，包含简介优化、平台样本与口吻规则及保险内容风控要求。本机既有安装需另行更新。
 - 教学目标围绕被看见、被相信、被选择；学员专用流程与多用户权限仍需后续开发。
 
@@ -16,6 +18,8 @@
 原版安装步骤及依赖见 [Easel上游说明](README_UPSTREAM.md)。需要Python 3.10+、相应Agent执行引擎及按需配置的媒体服务；自行配置 `.env`，不得提交真实密钥。Windows可参考 `setup.ps1`，安装完成后使用 `启动Easel.ps1` 在127.0.0.1:7860启动本机服务。
 
 公共源码副本没有打包虚拟环境、Node依赖与个人配置；克隆后需要安装依赖。所有账号授权、AI服务配置及发布动作应在使用者自己的环境完成。
+
+小红书读取模块还需在 `skills/builtin/skill-xhs-analyzer` 目录运行 `npm ci --ignore-scripts` 和 `node node_modules/typescript/bin/tsc`，生成本机使用的 `dist` 文件。该模块要求 Node.js 22+；前端按上游安装说明另行构建。
 
 ## 来源与许可证
 

@@ -19,7 +19,7 @@ for (const platform of ['zhihu', 'xiaohongshu', 'weixin-channels']) {
     const calls = [];
     const exports = {};
     runInNewContext(outputText, {
-      exports, encodeURIComponent,
+      exports, encodeURIComponent, AbortSignal,
       request: async (path, options) => { calls.push({ path, options }); return { state: 'starting' }; },
     });
     assert.equal((await exports.startLogin(platform)).state, 'starting');

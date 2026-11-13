@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
-"""xhs_publish.py — 小红书发布（Playwright，headless 可用）.
+"""xhs_publish.py — 小红书平台草稿保存（Playwright）。
 
-替代旧的 CDP-to-真实Chrome 死栈（那套需桌面 Chrome，本 Linux 环境跑不了）。
-本脚本用 Playwright + 持久化登录态，headless 即可发布，流程与选择器移植自
-xpzouying/xiaohongshu-mcp（Go/go-rod，成熟稳定）。确定性 IO 固化在脚本，
-文案/策略仍由上层 LLM 决定。
+publish / publish-video 执行时一律仅保存平台草稿，省略 --draft 也不会公开发布。
+--draft 是显式兼容参数；没有公开发布开关。必须获得平台明确草稿保存成功提示，
+才输出 {"outcome":"draft_saved","published":false}，否则非零退出。
 
-移植的关键健壮技巧（源见各处 REF 注释）：
-  - 切「上传图文/视频」tab：重试 + 遮挡检测 + 移除弹层
-  - 逐图上传并等预览出现（≤60s）；视频等发布按钮可点击（≤10min = 处理完成）
-  - 话题：输 # + 联想下拉点选，真绑话题
-  - 发布按钮：新版 <xhs-publish-btn> + 旧版 .bg-red 双兼容
-  - 发布成功校验：URL 离开 /publish/publish 才算成功（消除假成功）
-  - 反检测：--disable-blink-features=AutomationControlled + 逐字符输入 + zh-CN
-
-子命令:
-  check          验 playwright + chromium 内核
-  login          有头扫码登录并持久化 cookie
-  plan           离线打印发布步骤与选择器（不启浏览器）
-  publish        图文发布（--images 逗号分隔）
-  publish-video  视频发布（--video）
-  selftest       离线自检（选择器字典 / 参数解析 / 标题长度算法）
-
-真实发布需：playwright + chromium 内核 + 已扫码登录 + 外网可达（默认走项目代理）。
+check 检查环境；login 登录；plan 离线预览草稿步骤；selftest 离线自检。
+旧公开发布辅助函数保留供代码兼容，但不接入任何 CLI 执行入口。
 """
 from __future__ import annotations
 
@@ -140,6 +124,11 @@ def _abspaths(csv: str | None) -> list[str]:
 def _profile_dir(base: str | None) -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".easel-browser-profiles"
     return root / PROFILE_NAME
+
+
+def _community_profile_base() -> str:
+    """Separate community-reader browser state from the publishing profile."""
+    return str(Path.home() / ".easel-browser-profiles" / "community-reader")
 
 
 def _cloak_executable() -> Path | None:
@@ -266,7 +255,7 @@ def _login_error(page) -> str:
         if code == "300012" or "IP存在风险" in re.sub(r"\s+", "", text).upper():
             detail = f"（错误码 {code}）" if code else ""
             return (f"小红书返回 IP 风险限制{detail}，二维码无法获取。"
-                    "请在可信网络重试；服务器/机房出口可能被平台限制，Easel 无法保证解除风控。")
+                    "请在可信网络重试；服务器/机房出口可能被平台限制，xh 无法保证解除风控。")
         detail = f"（错误码 {code}）" if code else ""
         return f"小红书登录被平台拦截{detail}，不一定是 IP 问题。请检查网络，或使用 --headed 查看平台提示。"
     except Exception:
@@ -283,6 +272,104 @@ def _visible_login_element(page, selectors: str):
             if element.is_visible():
                 return element
     return None
+
+
+def _auth_error_type(error) -> str:
+    name = type(error).__name__ if error is not None else 'UnknownError'
+    return name if name in {
+        'Error', 'TimeoutError', 'RuntimeError', 'ValueError', 'TypeError', 'OSError',
+        'ImportError', 'ModuleNotFoundError', 'PermissionError', 'ConnectionError', 'TargetClosedError', 'SystemExit',
+    } else 'UnknownError'
+
+
+def _safe_auth_location(raw_url):
+    try:
+        url = urlparse(raw_url or '')
+        if url.scheme != 'https' or url.hostname not in ('creator.xiaohongshu.com', 'www.xiaohongshu.com') or url.port not in (None, 443):
+            return '<non_official>', False
+        return 'https://' + url.hostname + url.path, url.hostname == 'creator.xiaohongshu.com' and url.path.rstrip('/') == '/login'
+    except Exception:
+        return '<unavailable>', False
+
+
+def _failure_screenshot(page, prefix):
+    if not callable(getattr(page, 'screenshot', None)):
+        return '<unavailable>'
+    try:
+        directory = PROJECT_ROOT / 'outputs' / '_runtime' / 'draft-r1'
+        directory.mkdir(parents=True, exist_ok=True)
+        screenshot = directory / f'{prefix}-{time.time_ns()}.png'
+        page.screenshot(path=str(screenshot), full_page=False, timeout=3000)
+        return str(screenshot)
+    except Exception:
+        return '<unavailable>'
+
+
+def _auth_snapshot(page, stage, *, login_ok=None, error=None, screenshot=False):
+    try:
+        location, login_path = _safe_auth_location(page.url)
+    except Exception as location_error:
+        location, login_path = '<unavailable>', False
+        error = error or location_error
+    try:
+        wall = _visible_login_element(page, SELECTORS['logged_out']) is not None
+    except Exception as probe_error:
+        wall = None
+        error = error or probe_error
+    state = 'auth_required' if login_path and wall is True and error is None else 'auth_unknown'
+    fields = {'stage': stage, 'state': state, 'url': location, 'login_ok': login_ok,
+              'login_wall': wall, 'action_sent': False, 'error_type': _auth_error_type(error)}
+    if screenshot:
+        fields['screenshot'] = _failure_screenshot(page, 'auth-refusal')
+    print('XHS_AUTH_DIAGNOSTIC ' + json.dumps(fields, ensure_ascii=False), file=sys.stderr)
+    return fields
+
+
+def _stop_publish_auth(page, *, login_ok, stage='publish_auth', error=None, attempt=None):
+    diagnostic = _auth_snapshot(page, stage, login_ok=login_ok, error=error, screenshot=True)
+    code = 'XHS_AUTH_REQUIRED' if diagnostic['state'] == 'auth_required' else 'XHS_AUTH_UNKNOWN'
+    if attempt is not None:
+        attempt['terminal_reported'] = True
+    print(json.dumps({'outcome': diagnostic['state'], 'published': False, 'error': code,
+                      'stage': stage, 'error_type': diagnostic['error_type']}))
+    _die('小红书创作平台要求登录，请在账号管理完成登录后再保存草稿' if code == 'XHS_AUTH_REQUIRED'
+         else '小红书认证状态未确认；本次未执行草稿保存，请稍后校验账号')
+
+
+def _whoami_failure(result, stage, error, code='XHS_WHOAMI_UNCONFIRMED'):
+    fields = {'error': code, 'stage': stage, 'error_type': _auth_error_type(error)}
+    result.update(fields)
+    print('XHS_AUTH_DIAGNOSTIC ' + json.dumps(fields), file=sys.stderr)
+
+
+def _publish_failure(attempt, error, *, cleanup=False):
+    """Only fixed metadata crosses the runner boundary; never exception text."""
+    action = attempt.get('action_sent', False)
+    safe = {'stage': 'cleanup' if cleanup else attempt['stage'], 'published': False,
+            'action_sent': action, 'confirmation_sent': attempt.get('confirmation_sent', False),
+            'error_type': _auth_error_type(error),
+            'errorCode': ('XHS_CLEANUP_FAILED' if cleanup else
+                          'XHS_DRAFT_STAGE_FAILED' if action is False else 'XHS_DRAFT_STAGE_UNCONFIRMED')}
+    if not cleanup and attempt.get('cleanup_error_type'):
+        safe['cleanup_error_type'] = attempt['cleanup_error_type']
+    if attempt.get('page') is not None:
+        safe['screenshot'] = _failure_screenshot(attempt['page'], 'stage-failure')
+    print('XHS_FAILURE_DIAGNOSTIC ' + json.dumps(safe), file=sys.stderr)
+    if not cleanup:
+        print(json.dumps({'outcome': 'failed', 'published': False, 'failureDiagnostic': safe}))
+
+
+def _publish_cleanup_error(attempt, error):
+    attempt['cleanup_error_type'] = _auth_error_type(error)
+    _publish_failure(attempt, error, cleanup=True)
+
+
+def _draft_action_attempt(attempt, *, confirmation=False):
+    if attempt is not None:
+        attempt['stage'] = 'confirmation' if confirmation else 'draft_action'
+        attempt['confirmation_sent' if confirmation else 'action_sent'] = None
+    _draft_button_diagnostic('draft_confirmation_attempt' if confirmation else 'draft_action_attempt',
+                             **{'confirmation_sent' if confirmation else 'action_sent': None})
 
 
 def _open_login_dialog(page) -> None:
@@ -323,10 +410,10 @@ def _missing_qr_reason(page) -> str:
     return "未找到可识别的登录二维码，登录弹窗未打开或页面结构已变化"
 
 
-def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False) -> bool:
+def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False, community_only: bool = False) -> bool:
     """首页无法出码时只尝试一次官方创作平台入口；False 表示已登录。"""
     failures = []
-    for url in ((CREATOR_LOGIN_URL,) if creator_only else (None, CREATOR_LOGIN_URL)):
+    for url in ((None,) if community_only else (CREATOR_LOGIN_URL,) if creator_only else (None, CREATOR_LOGIN_URL)):
         entry = "创作平台" if url else "小红书首页"
         try:
             if url:
@@ -335,7 +422,7 @@ def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False) -> bool
             reason = f"打不开小红书创作平台（{type(error).__name__}），请检查网络连接后重试"
             failures.append(f"{entry}：{reason}")
             continue
-        if _is_logged_in(page):
+        if not community_only and _is_logged_in(page):
             return False
         reason = _login_error(page)
         if not reason:
@@ -349,7 +436,7 @@ def _capture_login_qr(page, qr_out: Path, *, creator_only: bool = False) -> bool
                                     SELECTORS["qr_switch"], minimum_size=96)
                 return True
             except Exception as error:
-                if _is_logged_in(page):
+                if not community_only and _is_logged_in(page):
                     return False
                 reason = _login_error(page) or _missing_qr_reason(page)
                 print(f"小红书抓码失败（{entry}/{type(error).__name__}）：{reason}", file=sys.stderr)
@@ -465,8 +552,15 @@ def _check_account_login(page) -> bool:
                 return True
             outcomes.append("unknown" if _login_error(page) or not _visible_login_element(
                 page, SELECTORS["logged_out"]) else "logged_out")
-        except Exception:
+            diagnostic = _auth_snapshot(page, 'whoami_creator_page' if destination == CREATOR_HOME_URL else 'whoami_web_page')
+            # Account management connects publishing accounts. A proven creator
+            # login wall must not be masked by an unrelated web-site fallback.
+            if (destination == CREATOR_HOME_URL and outcomes[-1] == 'logged_out'
+                    and diagnostic['state'] == 'auth_required'):
+                return False
+        except Exception as error:
             outcomes.append("unknown")
+            _auth_snapshot(page, 'whoami_creator_page' if destination == CREATOR_HOME_URL else 'whoami_web_page', error=error)
     if any(outcome != "logged_out" for outcome in outcomes):
         raise RuntimeError("小红书登录校验暂未完成：网络超时、维护/风控页面或账号界面未就绪；保留上次登录状态")
     return False
@@ -760,30 +854,65 @@ def _click_publish_tab(page, tabname: str) -> None:
     _die(f"未找到发布 TAB：{tabname}（页面结构可能已变，检查 SELECTORS.creator_tab）")
 
 
+_IMAGE_UPLOAD_STATES = r'''() => {
+    const visible = node => !!node && node.isConnected && node.getClientRects().length > 0
+        && getComputedStyle(node).visibility !== 'hidden' && getComputedStyle(node).display !== 'none';
+    return [...document.querySelectorAll('.img-preview-area .pr')].map(slot => {
+        const text = (slot.innerText || '').replace(/\s+/g, '');
+        const images = [...slot.querySelectorAll('img.img.preview')];
+        const controls = [...slot.querySelectorAll('.image-editor-control .image-editor-actions.has-editor-info button.edit-btn')];
+        const image = images.length === 1 ? images[0] : null;
+        const control = controls.length === 1 ? controls[0] : null;
+        return {
+            visible: visible(slot),
+            loaded: visible(image) && image.complete === true && image.naturalWidth > 0 && image.naturalHeight > 0,
+            ready: visible(control) && control.disabled === false && control.getAttribute('aria-disabled') !== 'true',
+            pending: !!slot.querySelector('.processing-container, .progress-container, .spinner-red, .prerender, .mask.uploading'),
+            failed: text.includes('上传失败'), retry: text.includes('重试')
+        };
+    });
+}'''
+
+
 def _upload_images(page, paths: list[str]) -> None:
-    """逐张上传并等预览出现（≤60s/张）。REF uploadImages/waitForUploadComplete。"""
+    """Wait for every observed image slot to finish processing; never retry an upload."""
     for i, path in enumerate(paths):
         sel = SELECTORS["upload_input_first"] if i == 0 else SELECTORS["upload_input_more"]
         page.set_input_files(sel, path)
-        print(f"  上传图片 {i+1}/{len(paths)}: {path}", file=sys.stderr)
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            if len(page.query_selector_all(SELECTORS["img_preview"])) >= i + 1:
+        print(f"  等待图片 {i+1}/{len(paths)} 上传完成", file=sys.stderr)
+        deadline = time.monotonic() + 60
+        while True:
+            try:
+                states = page.evaluate(_IMAGE_UPLOAD_STATES)
+                fields = ('visible', 'loaded', 'ready', 'pending', 'failed', 'retry')
+                if not isinstance(states, list) or any(not isinstance(state, dict) or any(
+                        type(state.get(field)) is not bool for field in fields) for state in states):
+                    raise ValueError('image upload state unavailable')
+            except Exception as error:
+                _draft_button_diagnostic('image_upload_unconfirmed', errorCode='XHS_IMAGE_UPLOAD_UNCONFIRMED',
+                                         error_type=_auth_error_type(error))
+                _die('XHS_IMAGE_UPLOAD_UNCONFIRMED：无法核验图片上传状态；未执行保存')
+            if any(state['failed'] or state['retry'] for state in states):
+                _draft_button_diagnostic('image_upload_failed', errorCode='XHS_IMAGE_UPLOAD_FAILED', states=states[:18])
+                _die('XHS_IMAGE_UPLOAD_FAILED：平台显示图片上传失败或待重试；未执行保存')
+            if time.monotonic() >= deadline:
+                _draft_button_diagnostic('image_upload_timeout', errorCode='XHS_IMAGE_UPLOAD_UNCONFIRMED',
+                                         required_count=i + 1, states=states[:18])
+                _die('XHS_IMAGE_UPLOAD_UNCONFIRMED：图片上传完成状态未确认（60s）；未执行保存')
+            if len(states) == i + 1 and all(state['visible'] and state['loaded'] and state['ready']
+                                            and not state['pending'] for state in states):
                 break
             page.wait_for_timeout(500)
-        else:
-            _die(f"第 {i+1} 张图片上传超时（60s）")
-        page.wait_for_timeout(1000)
 
 
 def _upload_video(page, path: str) -> None:
-    """上传视频，等发布按钮可点击（≤10min = 处理完成）。REF publish_video.go uploadVideo。"""
+    """上传视频并等待编辑器就绪；草稿流程不探测公开发布按钮。"""
     sel = SELECTORS["upload_input_first"]
     if not page.query_selector(sel):
         sel = SELECTORS["upload_input_more"]
     page.set_input_files(sel, path)
     print(f"  上传视频：{path}（等待处理，最长 10min）", file=sys.stderr)
-    _wait_publish_clickable(page, timeout_s=600)
+    page.wait_for_selector(SELECTORS["title_input"], state="visible", timeout=600000)
 
 
 def _content_element(page):
@@ -957,8 +1086,8 @@ def _normalize_content(text: str) -> str:
     return text.strip("\n")
 
 
-def _fill_and_submit(page, title, content, tags):
-    """标题→正文→话题→长度校验→发布→成功校验。"""
+def _fill_editor(page, title, content, tags):
+    """仅填写编辑器与长度校验；不点击提交。"""
     content = _normalize_content(content)         # 修连续空行导致的发布失败
     title_el = page.query_selector(SELECTORS["title_input"])
     if not title_el:
@@ -976,6 +1105,10 @@ def _fill_and_submit(page, title, content, tags):
 
     _check_overflow(page)
 
+
+def _fill_and_submit(page, title, content, tags):
+    """旧公开发布helper；当前CLI不会调用。"""
+    _fill_editor(page, title, content, tags)
     kind, btn = _wait_publish_clickable(page, 15)
     btn.scroll_into_view_if_needed()
     page.wait_for_timeout(300)
@@ -994,16 +1127,517 @@ def _fill_and_submit(page, title, content, tags):
     _wait_publish_success(page, 40)
 
 
+_DRAFT_BUTTON_NAME = re.compile(r"^(?:暂存离开|存草稿|保存草稿)$")
+_DRAFT_SUCCESS_TEXTS = (
+    "草稿保存成功", "保存草稿成功", "草稿已保存", "已保存草稿", "已存为草稿", "已保存至草稿箱", "草稿保存完成",
+)
+_DRAFT_SUCCESS = re.compile(r"^(?:" + "|".join(_DRAFT_SUCCESS_TEXTS) + r")[！!。]?$")
+# Deliberately narrow: nested editor/preview components and generic ARIA messages
+# are not platform receipts. Unrecognised live structures must fail closed.
+_DRAFT_NOTICES = "body > .d-message, body > .d-toast"
+_DRAFT_NOTICE_HISTORY = ".d-message, .d-toast"
+_DRAFT_EDITABLE = "input, textarea, [contenteditable], [role='textbox']"
+# Structure from soup-song/xhs-refactored b848941, internal/action/publish.go:677.
+# Its broad non-red button and sleep-based completion are deliberately not used.
+_DRAFT_DIALOGS = "div.creator-publish-popover, [role='dialog']"
+_DRAFT_CONFIRM_LABELS = frozenset(('离开', '确认离开', '保存并离开', '暂存离开', '存草稿', '保存草稿'))
+_DRAFT_CANCEL_LABELS = frozenset(('取消', '继续编辑', '返回'))
+_DRAFT_CONFIRM_PROMPTS = (
+    '是否保存草稿', '是否保存草稿并离开', '是否将当前内容保存为草稿并离开',
+    '当前内容将保存至草稿箱，是否离开', '当前内容将保存为草稿，是否离开',
+    '是否暂存并离开', '是否暂存当前内容并离开',
+)
+# A non-configurable own property survives same-document URL changes. Only its
+# proven absence on a live notice's document can retire old-context handles.
+_DRAFT_DOCUMENT_CHECK = r'''(doc, marker) => {
+    const own = Object.getOwnPropertyDescriptor(doc, marker.key);
+    if (own === undefined) return 'new';
+    return own.value === marker.value && own.configurable === false
+        && own.writable === false && own.enumerable === false ? 'same' : 'unknown';
+}'''
+_DRAFT_DOCUMENT_MARK = r'''marker => {
+    if (Object.getOwnPropertyDescriptor(document, marker.key) !== undefined) return false;
+    Object.defineProperty(document, marker.key, {value: marker.value});
+    return (CHECK)(document, marker) === 'same';
+}'''.replace('CHECK', _DRAFT_DOCUMENT_CHECK)
+_DRAFT_DOCUMENT_CURRENT = 'marker => (' + _DRAFT_DOCUMENT_CHECK + ")(document, marker) === 'same'"
+_DRAFT_DOCUMENT_STATUS = 'marker => (' + _DRAFT_DOCUMENT_CHECK + ')(document, marker)'
+_DRAFT_NOTICE_DOCUMENT = r'''(node, marker) => {
+    if (!node.isConnected || node.ownerDocument !== document) return 'unknown';
+    return (CHECK)(document, marker);
+}'''.replace('CHECK', _DRAFT_DOCUMENT_CHECK)
+
+
+def _draft_success_visible(page, previous, document_marker) -> bool:
+    """Accept only a new root platform notification, never an existing DOM node."""
+    for notice in page.locator(_DRAFT_NOTICES).element_handles():
+        if not notice.is_visible():
+            continue
+        if re.search(r"editor|preview", notice.get_attribute("class") or "", re.IGNORECASE):
+            continue
+        if notice.evaluate("(node, selector) => node.matches(selector)", _DRAFT_EDITABLE) or notice.query_selector(_DRAFT_EDITABLE):
+            continue
+        document_state = notice.evaluate(_DRAFT_NOTICE_DOCUMENT, document_marker)
+        if document_state not in ('same', 'new'):
+            continue
+        if document_state == 'same' and any(notice.evaluate("(node, previous) => node === previous", old) for old in previous):
+            continue
+        if _DRAFT_SUCCESS.fullmatch(" ".join((notice.inner_text() or "").split())):
+            return True
+    return False
+
+
+# CDP is used only inside the product's already-running Playwright context.
+# It never clicks a host box: the closed root must expose a real semantic button.
+_CDP_DRAFT_ACTION = r'''function(expectedLabel, click, expectedHost) {
+    const allowed = new Set(['暂存离开', '存草稿', '保存草稿']);
+    const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+    const labelOf = node => {
+        const text = clean(node.innerText || node.textContent);
+        const aria = clean(node.getAttribute('aria-label'));
+        return text && aria && text !== aria ? '' : (text || aria);
+    };
+    const root = this.getRootNode();
+    const host = root && root.host;
+    const label = labelOf(this);
+    const semantic = this.tagName === 'BUTTON' || this.getAttribute('role') === 'button';
+    const valid = this.isConnected && location.origin === 'https://creator.xiaohongshu.com'
+        && location.pathname === '/publish/publish' && semantic && allowed.has(label)
+        && label === expectedLabel && root.mode === 'closed'
+        && host && host === expectedHost && host.tagName === 'XHS-PUBLISH-BTN' && host.isConnected
+        && !this.matches('input,textarea,[contenteditable]');
+    const visible = node => {
+        const rect = node.getBoundingClientRect();
+        if (!rect.width || !rect.height || !node.getClientRects().length
+                || rect.bottom <= 0 || rect.right <= 0
+                || rect.top >= innerHeight || rect.left >= innerWidth) return false;
+        for (let el = node; el; el = el.parentElement || el.getRootNode().host) {
+            const style = getComputedStyle(el);
+            if (el.hidden || style.display === 'none' || style.visibility !== 'visible'
+                    || Number(style.opacity) === 0) return false;
+        }
+        return true;
+    };
+    let enabled = valid;
+    for (let el = this; el; el = el.parentElement || el.getRootNode().host) {
+        if (el.disabled || el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true'
+                || el.hasAttribute('inert') || getComputedStyle(el).pointerEvents === 'none') enabled = false;
+    }
+    const state = {valid: !!valid, label, visible: !!valid && visible(this), enabled: !!enabled, clicked: false};
+    if (!click || !state.valid || !state.visible || !state.enabled) return state;
+    // Check again in the same synchronous call that invokes the semantic action.
+    const matches = [...root.querySelectorAll('button,[role="button"]')]
+        .filter(node => allowed.has(labelOf(node)) && visible(node));
+    if (matches.length !== 1 || matches[0] !== this) return {...state, valid: false};
+    HTMLElement.prototype.click.call(this);
+    return {...state, clicked: true};
+}'''
+
+
+def _draft_button_diagnostic(stage: str, **safe_fields) -> None:
+    """Only controlled labels and structural metadata, never page text or secrets."""
+    print('XHS_DRAFT_DIAGNOSTIC ' + json.dumps({'stage': stage, **safe_fields}, ensure_ascii=False), file=sys.stderr)
+
+
+def _draft_timeout_diagnostic(page, document_marker, confirmation_sent=False) -> None:
+    """Best-effort, read-only evidence; log only a path and controlled labels."""
+    fields = {'action_sent': True, 'confirmation_sent': confirmation_sent, 'notice_confirmed': False,
+              'document_state': 'unknown', 'url': '<unavailable>', 'buttons': [], 'dialogs': [],
+              'notices': [], 'confirmation_dialog_count': 0, 'confirmation_buttons': []}
+    allowed = set(_DRAFT_SUCCESS_TEXTS) | set(_DRAFT_CONFIRM_PROMPTS) | {
+        '暂存离开', '存草稿', '保存草稿', '是否保存草稿', '草稿保存失败', '保存草稿失败',
+        '草稿保存中', '正在保存草稿', '保存并离开', '确认离开', '继续编辑', '取消', '确定',
+        '离开', '不保存', '不保存离开', '放弃', '直接离开', '确认', '确认发布',
+    }
+    names = re.compile(r'^(?:' + '|'.join(re.escape(label) for label in sorted(allowed)) + r')[！!。]?$')
+    try:
+        url = urlparse(page.url or '')
+        fields['url'] = ('https://creator.xiaohongshu.com' + url.path
+                         if url.scheme == 'https' and url.hostname == 'creator.xiaohongshu.com'
+                         else '<non_official>')
+    except Exception:
+        pass
+    try:
+        state = page.evaluate(_DRAFT_DOCUMENT_STATUS, document_marker)
+        if state in ('same', 'new', 'unknown'):
+            fields['document_state'] = state
+    except Exception:
+        pass
+    for role, field in (('button', 'buttons'), ('dialog', 'dialogs'), (None, 'notices')):
+        try:
+            locator = page.get_by_role(role, name=names) if role else page.locator(_DRAFT_NOTICES)
+            # Handles avoid locator auto-waits extending an already-expired gate.
+            for item in locator.element_handles()[:20]:
+                if not item.is_visible():
+                    continue
+                label = ' '.join((item.inner_text() or item.get_attribute('aria-label') or '').split())
+                if names.fullmatch(label) and label not in fields[field]:
+                    fields[field].append(label)
+        except Exception:
+            pass
+    try:
+        dialogs = _visible_draft_dialogs(page)
+        fields['confirmation_dialog_count'] = len(dialogs)
+        for dialog in dialogs[:10]:
+            for button in dialog.query_selector_all('button,[role="button"]')[:20]:
+                if button.is_visible():
+                    label = _draft_control_label(button)
+                    safe = label if names.fullmatch(label) else '<other>'
+                    if safe not in fields['confirmation_buttons']:
+                        fields['confirmation_buttons'].append(safe)
+    except Exception:
+        pass
+    if callable(getattr(page, 'screenshot', None)):
+        fields['screenshot'] = _failure_screenshot(page, 'draft-timeout')
+    _draft_button_diagnostic('receipt_timeout', **fields)
+
+
+def _cdp_nodes(root):
+    stack, count = [root], 0
+    while stack:
+        node = stack.pop()
+        count += 1
+        if count > 50000:
+            raise ValueError('DOM tree limit')
+        yield node
+        stack.extend(reversed(node.get('children', []) + node.get('shadowRoots', [])))
+
+
+def _cdp_draft_candidates(session):
+    document = session.send('DOM.getDocument', {'depth': -1, 'pierce': True})
+    candidates, diagnostics = [], []
+    root_document = document.get('root', {})
+    if root_document.get('nodeType') != 9 or root_document.get('nodeName') != '#document' or root_document.get('documentURL', '').split('?', 1)[0] != PUBLISH_URL.split('?', 1)[0]:
+        raise ValueError('not the official top-level document')
+    for host in _cdp_nodes(root_document):
+        if host.get('nodeType') != 1 or host.get('nodeName') != 'XHS-PUBLISH-BTN' or host.get('localName') != 'xhs-publish-btn':
+            continue
+        roots = host.get('shadowRoots', [])
+        entry = {'closed': any(root.get('shadowRootType') == 'closed' for root in roots), 'buttons': []}
+        diagnostics.append(entry)
+        for root in roots:
+            if root.get('shadowRootType') != 'closed':
+                continue
+            for node in _cdp_nodes(root):
+                attrs = dict(zip(node.get('attributes', [])[::2], node.get('attributes', [])[1::2]))
+                if node.get('nodeName', '').upper() != 'BUTTON' and attrs.get('role') != 'button':
+                    continue
+                text = ' '.join(''.join(n.get('nodeValue', '') for n in _cdp_nodes(node)
+                                      if n.get('nodeType') == 3).split())
+                aria = ' '.join(attrs.get('aria-label', '').split())
+                label = '' if text and aria and text != aria else (text or aria)
+                safe_label = label if label in ('暂存离开', '存草稿', '保存草稿', '发布', '确认', '确定', '确认发布', '立即发布', '取消', '返回') else '<other>'
+                if len(entry['buttons']) < 20:
+                    entry['buttons'].append({'label': safe_label, 'semantic': 'BUTTON' if node.get('nodeName', '').upper() == 'BUTTON' else 'role=button'})
+                if _DRAFT_BUTTON_NAME.fullmatch(label):
+                    backend, host_backend = node.get('backendNodeId'), host.get('backendNodeId')
+                    if type(backend) is not int or type(host_backend) is not int:
+                        raise ValueError('missing stable node identity')
+                    candidates.append((backend, host_backend, label))
+    _draft_button_diagnostic('closed_shadow_scan', hosts=diagnostics[:10], candidates=len(candidates))
+    return candidates
+
+
+class _DraftActionUnknown(RuntimeError):
+    """A dispatched action has no trustworthy response; never repeat it."""
+
+
+def _visible_draft_dialogs(page):
+    return [dialog for dialog in page.locator(_DRAFT_DIALOGS).element_handles() if dialog.is_visible()]
+
+
+def _draft_control_label(button):
+    text = ' '.join((button.inner_text() or '').split())
+    aria = ' '.join((button.get_attribute('aria-label') or '').split())
+    return '' if text and aria and text != aria else (text or aria)
+
+
+def _picture_edit_guide_button(dialog):
+    """Recognise only the observed image-edit onboarding, never a save dialog."""
+    if (dialog.get_attribute('role') != 'dialog'
+            or set((dialog.get_attribute('class') or '').split()) != {'feature-guide', 'feature-guide--with-arrow'}):
+        return None
+    if dialog.evaluate('node => node.isConnected && node.ownerDocument === document && window === window.top') is not True:
+        return None
+    if dialog.query_selector(_DRAFT_EDITABLE):
+        return None
+    buttons = [button for button in dialog.query_selector_all('button,[role="button"]') if button.is_visible()]
+    labels = [_draft_control_label(button) for button in buttons]
+    if len(buttons) not in (1, 2) or labels.count('我知道了') != 1:
+        return None
+    for button, label in zip(buttons, labels):
+        if label == '我知道了':
+            continue
+        if (button.get_attribute('class') != 'feature-guide__close'
+                or label not in ('', '关闭', '关闭新功能引导')) or (label == '' and (
+                (button.inner_text() or '').strip() or (button.get_attribute('aria-label') or '').strip())):
+            return None
+    acknowledgement = buttons[labels.index('我知道了')]
+    if acknowledgement.get_attribute('class') != 'feature-guide__btn' or not acknowledgement.is_enabled():
+        return None
+    expected = '图片可以编辑啦，快来试试吧支持裁剪图片大小、选择模版或滤镜、添加贴纸和文字我知道了'
+    if re.sub(r'\s+', '', dialog.inner_text() or '') != expected:
+        return None
+    return acknowledgement
+
+
+def _dismiss_picture_edit_guide(page):
+    # This one-time onboarding click precedes the receipt baseline. It is not a
+    # draft action or receipt; all unrecognised dialogs retain the baseline veto.
+    dialogs = _visible_draft_dialogs(page)
+    if len(dialogs) != 1:
+        return
+    url = urlparse(page.url or '')
+    if url.scheme != 'https' or url.netloc != 'creator.xiaohongshu.com' or url.path != '/publish/publish':
+        return
+    dialog = dialogs[0]
+    button = _picture_edit_guide_button(dialog)
+    if button is None:
+        return
+    fresh_dialogs = _visible_draft_dialogs(page)
+    if (len(fresh_dialogs) != 1
+            or fresh_dialogs[0].evaluate('(node, previous) => node === previous', dialog) is not True):
+        raise ValueError('picture guide changed before dismissal')
+    fresh_button = _picture_edit_guide_button(fresh_dialogs[0])
+    if fresh_button is None or fresh_button.evaluate('(node, previous) => node === previous', button) is not True:
+        raise ValueError('picture guide control changed before dismissal')
+    # Native click retains actionability/hit checks. Never retry an uncertain click.
+    fresh_button.click(timeout=5000)
+    dialog.wait_for_element_state('hidden', timeout=5000)
+    _draft_button_diagnostic('picture_edit_guide_dismissed')
+
+
+def _draft_confirmation_button(dialog, document_marker):
+    if dialog.evaluate(_DRAFT_NOTICE_DOCUMENT, document_marker) not in ('same', 'new'):
+        raise ValueError('confirmation document unavailable')
+    if dialog.evaluate('(node, selector) => node.matches(selector)', _DRAFT_EDITABLE) or dialog.query_selector(_DRAFT_EDITABLE):
+        raise ValueError('editable confirmation is not trusted')
+    buttons = [button for button in dialog.query_selector_all('button,[role="button"]') if button.is_visible()]
+    labels = [_draft_control_label(button) for button in buttons]
+    if not labels or any(label not in _DRAFT_CONFIRM_LABELS | _DRAFT_CANCEL_LABELS for label in labels):
+        raise ValueError('unsupported confirmation controls')
+    # Match the complete prompt and all visible controls, never a draft substring.
+    compact = re.sub(r'\s+', '', dialog.inner_text() or '')
+    suffix = ''.join(labels)
+    prompt = next((prompt for prompt in _DRAFT_CONFIRM_PROMPTS
+                   if any(compact == prompt + ending + suffix for ending in ('', '？', '?', '。'))), None)
+    if prompt is None:
+        raise ValueError('unsupported confirmation intent')
+    affirmative = [(button, label) for button, label in zip(buttons, labels) if label in _DRAFT_CONFIRM_LABELS]
+    if len(affirmative) != 1 or not affirmative[0][0].is_enabled():
+        raise ValueError('confirmation is ambiguous or disabled')
+    return affirmative[0][0], affirmative[0][1], prompt
+
+
+def _confirm_draft_dialog(page, document_marker, attempt=None) -> bool:
+    """One explicit save-draft confirmation; this is never a save receipt."""
+    dialogs = _visible_draft_dialogs(page)
+    if not dialogs:
+        return False
+    url = urlparse(page.url or '')
+    if len(dialogs) != 1 or url.scheme != 'https' or url.hostname != 'creator.xiaohongshu.com' or url.path != '/publish/publish':
+        raise ValueError('untrusted confirmation scope')
+    button, label, prompt = _draft_confirmation_button(dialogs[0], document_marker)
+    fresh, fresh_label, fresh_prompt = _draft_confirmation_button(dialogs[0], document_marker)
+    if (fresh_label, fresh_prompt) != (label, prompt) or fresh.evaluate('(node, previous) => node === previous', button) is not True:
+        raise ValueError('confirmation changed before action')
+    try:
+        # Native semantic element click retains Playwright's overlay/hit checks.
+        _draft_action_attempt(attempt, confirmation=True)
+        fresh.click(timeout=5000)
+    except Exception as error:
+        if attempt is not None:
+            attempt['primary_error'] = error
+        raise _DraftActionUnknown('confirmation response unavailable') from None
+    _draft_button_diagnostic('draft_confirmation_sent', label=label)
+    if attempt is not None:
+        attempt.update(stage='receipt', confirmation_sent=True)
+    return True
+
+
+def _cdp_draft_state(session, candidate, *, click=False, attempt=None):
+    backend, host_backend, label = candidate
+    objects = []
+    try:
+        for identity in (backend, host_backend):
+            remote = session.send('DOM.resolveNode', {'backendNodeId': identity}).get('object', {})
+            if not remote.get('objectId'):
+                raise ValueError('node is unavailable')
+            objects.append(remote['objectId'])
+        try:
+            if click:
+                _draft_action_attempt(attempt)
+            result = session.send('Runtime.callFunctionOn', {
+                'objectId': objects[0], 'functionDeclaration': _CDP_DRAFT_ACTION,
+                'arguments': [{'value': label}, {'value': click}, {'objectId': objects[1]}], 'returnByValue': True,
+            })
+        except Exception as error:
+            if click:
+                if attempt is not None:
+                    attempt['primary_error'] = error
+                raise _DraftActionUnknown('action response unavailable') from None
+            raise
+        if result.get('exceptionDetails'):
+            if click:
+                raise _DraftActionUnknown('action execution result unavailable')
+            raise ValueError('live node validation failed')
+        value = result.get('result', {}).get('value')
+        if not isinstance(value, dict) or value.get('valid') is not True or value.get('label') != label:
+            if click and (not isinstance(value, dict) or value.get('clicked') is not False):
+                raise _DraftActionUnknown('action result unavailable')
+            raise ValueError('live node identity changed')
+        return value
+    finally:
+        # Cleanup failure must never overwrite the action result or trigger a retry.
+        for object_id in objects:
+            try:
+                session.send('Runtime.releaseObject', {'objectId': object_id})
+            except Exception as error:
+                _draft_button_diagnostic('closed_shadow_cleanup_failed', error_type=type(error).__name__)
+
+
+def _cdp_pick_draft(session):
+    visible = []
+    for candidate in _cdp_draft_candidates(session):
+        state = _cdp_draft_state(session, candidate)
+        if state.get('visible') is True:
+            visible.append((candidate, state))
+    if len(visible) != 1 or visible[0][1].get('enabled') is not True:
+        raise ValueError('draft button is absent, ambiguous or disabled')
+    return visible[0][0]
+
+
+def _click_closed_shadow_draft(page, attempt=None) -> None:
+    """Fail closed unless two fresh pierced trees and live button checks agree."""
+    session = None
+    try:
+        if page.url.split('?', 1)[0] != PUBLISH_URL.split('?', 1)[0]:
+            raise ValueError('not the platform editor')
+        session = page.context.new_cdp_session(page)
+        candidate = _cdp_pick_draft(session)
+        if _cdp_pick_draft(session) != candidate:
+            raise ValueError('draft node changed before click')
+        state = _cdp_draft_state(session, candidate, click=True, attempt=attempt)
+        if state.get('visible') is not True or state.get('enabled') is not True or state.get('clicked') is not True:
+            raise ValueError('draft action was not verified')
+        _draft_button_diagnostic('closed_shadow_clicked', label=candidate[2])
+    except _DraftActionUnknown:
+        _draft_button_diagnostic('closed_shadow_result_unknown')
+        _die('草稿保存结果未确认：安全草稿操作已发送但结果未知，请先核对平台草稿；不会自动重试')
+    except Exception as error:
+        if attempt is not None:
+            attempt['primary_error'] = error
+        _draft_button_diagnostic('closed_shadow_blocked', error_type=type(error).__name__)
+        _die('未能安全确认闭合 Shadow DOM 内唯一可用的草稿按钮；已停止，不会公开发布')
+    finally:
+        if session is not None:
+            try:
+                session.detach()
+            except Exception:
+                pass
+
+
+def _save_draft(page, timeout_s: float = 30, *, attempt=None) -> None:
+    """Semantic light/closed-shadow draft action followed by a separate receipt gate."""
+    # Whole-body text is ONLY a veto. Hidden or copied old success text cannot
+    # become fresh evidence when made visible, moved, or cloned after the click.
+    document_marker = {'key': '_xhs_draft_receipt_' + os.urandom(16).hex(), 'value': os.urandom(16).hex()}
+    try:
+        _dismiss_picture_edit_guide(page)
+        if page.evaluate(_DRAFT_DOCUMENT_MARK, document_marker) is not True:
+            raise ValueError('document marker unavailable')
+        before_text = page.locator("body").text_content(timeout=5000) or ""
+        if any(text in re.sub(r"\s+", "", before_text) for text in _DRAFT_SUCCESS_TEXTS):
+            _die("点击前页面已包含草稿保存成功文案，无法核验本次通知来源；未执行保存")
+        previous = page.locator(_DRAFT_NOTICE_HISTORY).element_handles()
+        if _visible_draft_dialogs(page):
+            _die("点击前存在确认对话框，无法核验本次暂存来源；未执行保存")
+        if page.evaluate(_DRAFT_DOCUMENT_CURRENT, document_marker) is not True or any(
+                old.evaluate(_DRAFT_NOTICE_DOCUMENT, document_marker) != 'same' for old in previous):
+            raise ValueError('baseline document changed')
+    except Exception as error:
+        if attempt is not None:
+            attempt['primary_error'] = error
+        _draft_button_diagnostic('receipt_baseline_unavailable', error_type=type(error).__name__)
+        _die("点击前无法确认草稿通知所属文档；未执行保存")
+    deadline = time.monotonic() + timeout_s
+    button = None
+    while True:
+        buttons = page.get_by_role("button", name=_DRAFT_BUTTON_NAME)
+        visible = [buttons.nth(i) for i in range(buttons.count()) if buttons.nth(i).is_visible()]
+        if len(visible) > 1:
+            _die("检测到多个可见草稿保存按钮，无法唯一确认；未执行保存")
+        if len(visible) == 1 and visible[0].is_enabled():
+            button = visible[0]
+            break
+        if time.monotonic() >= deadline:
+            break
+        page.wait_for_timeout(200)
+    try:
+        if page.evaluate(_DRAFT_DOCUMENT_CURRENT, document_marker) is not True:
+            raise ValueError('action document changed')
+    except Exception as error:
+        if attempt is not None:
+            attempt['primary_error'] = error
+        _draft_button_diagnostic('receipt_baseline_unavailable', error_type=type(error).__name__)
+        _die("点击前草稿编辑文档已改变或不可确认；未执行保存")
+    if button is not None:
+        _draft_action_attempt(attempt)
+        button.click(timeout=5000)
+    else:
+        _click_closed_shadow_draft(page, attempt=attempt)
+    if attempt is not None:
+        attempt.update(stage='receipt', action_sent=True)
+    _draft_button_diagnostic('draft_action_sent')
+    deadline = time.monotonic() + timeout_s
+    receipt_error_logged = False
+    confirmation_sent = False
+    while True:
+        try:
+            if _draft_success_visible(page, previous, document_marker):
+                print("✅ 已检测到平台明确草稿保存成功提示", file=sys.stderr)
+                return
+            if not confirmation_sent and _confirm_draft_dialog(page, document_marker, attempt=attempt):
+                confirmation_sent = True
+                continue
+        except _DraftActionUnknown:
+            _draft_button_diagnostic('draft_confirmation_result_unknown')
+            _die("草稿保存结果未确认：草稿确认操作已发送但结果未知；不会自动重试")
+        except Exception as error:
+            # Navigation can destroy a notice query or an old handle comparison.
+            # An unreadable receipt is never success; retry only this read gate.
+            if not receipt_error_logged:
+                _draft_button_diagnostic('receipt_unavailable', error_type=type(error).__name__)
+                receipt_error_logged = True
+        if time.monotonic() >= deadline:
+            _draft_timeout_diagnostic(page, document_marker, confirmation_sent)
+            _die("草稿保存结果未确认：未出现明确的平台草稿保存成功提示；不会回退公开发布")
+        # Local pacing also works while the page's execution context is absent.
+        time.sleep(0.2)
+
+
+def _fill_and_save_draft(page, title, content, tags, *, attempt=None):
+    _fill_editor(page, title, content, tags)
+    if attempt is not None:
+        attempt['stage'] = 'draft_prepare'
+    _save_draft(page, attempt=attempt)
+    if attempt is not None:
+        attempt['receipt_confirmed'] = True
+
+
 # --------------------------------------------------------------------------- #
 # 命令
 # --------------------------------------------------------------------------- #
-def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_assets: bool = True):
+def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_assets: bool = True,
+            timeout_ms: int | None = None, retry_target_closed: bool = True):
     profile = _profile_dir(base)
     profile.mkdir(parents=True, exist_ok=True)
     args = list(LAUNCH_ARGS)
     kwargs = dict(headless=not headed,
                   locale="zh-CN",
                   args=args)
+    if timeout_ms is not None:
+        kwargs['timeout'] = timeout_ms
     if proxy:
         kwargs["proxy"] = {"server": proxy}
     else:
@@ -1017,7 +1651,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
         if channel:
             kwargs["channel"] = channel
     last: Exception | None = None
-    for attempt in range(2):
+    for attempt in range(2 if retry_target_closed else 1):
         try:
             context = p.chromium.launch_persistent_context(str(profile), **kwargs)
             if login_assets:
@@ -1025,7 +1659,7 @@ def _launch(p, headed: bool, base: str | None, proxy: str | None, *, login_asset
             return context
         except Exception as e:
             last = e
-            if attempt == 0 and "TargetClosed" in type(e).__name__:
+            if retry_target_closed and attempt == 0 and "TargetClosed" in type(e).__name__:
                 time.sleep(1.2)
                 _clear_stale_chrome_locks(profile)
                 continue
@@ -1086,6 +1720,65 @@ def _query_safe(page, selector: str):
         return None
 
 
+_LOGIN_BOX = ".login-container, .login-modal, .login-box, .sso-login-wrapper"
+
+
+def _community_login_surface_ready(page) -> bool:
+    """已登录、明确错误，或二维码/登录框已经可见。可见不等于登录成功。"""
+    if _login_error(page):
+        return True
+    try:
+        if _is_logged_in(page):
+            return True
+    except Exception:
+        pass
+    try:
+        qr = _visible_login_element(page, SELECTORS["qrcode"])
+        if qr is not None:
+            box = qr.bounding_box() or {}
+            if (box.get("width") or 0) >= 96 and (box.get("height") or 0) >= 96:
+                return True
+    except Exception:
+        pass
+    try:
+        return _visible_login_element(page, _LOGIN_BOX) is not None
+    except Exception:
+        return False
+
+
+def _wait_community_login_surface(page) -> None:
+    """先探测再等。未就绪最多 10×800ms，就绪则立刻交给原抓码流程。"""
+    for _ in range(10):
+        try:
+            if _community_login_surface_ready(page):
+                return
+        except Exception:
+            pass
+        page.wait_for_timeout(800)
+
+
+def _community_identity(context, timeout_s=6):
+    from redbook_read import _SessionError, community_status_from_context
+    try:
+        return community_status_from_context(context, timeout_s=timeout_s)
+    except _SessionError as error:
+        messages = {
+            'verification_required': '社区账号需要验证，已停止登录恢复。',
+            'ip_blocked': '社区账号受到网络风险限制，已停止登录恢复。',
+            'signature_error': '社区身份校验失败，已停止登录恢复。',
+            'api_error': '社区身份接口返回错误，已停止登录恢复。',
+            'timeout': '社区身份校验超时，登录状态未确认。',
+        }
+        stages = {
+            'cookie_read': '读取登录状态', 'cookie_select': '检查登录状态',
+            'node_resolve': '准备身份校验', 'node_exit': '请求身份接口',
+            'json_parse': '解析身份响应', 'identity_shape': '检查身份字段',
+        }
+        message = messages.get(error.code, '社区身份校验异常，登录状态未确认。')
+        stage = stages.get(error.stage, '身份校验')
+        raise RuntimeError(f"{message}（阶段：{stage}；类别：{error.code}）") from None
+
+
 def cmd_login(a) -> int:
     """headless 友好登录：把二维码抠成 PNG 供扫码，轮询登录成功后持久化 cookie。
     REF login.go FetchQrcodeImage/WaitForLogin。远程无桌面环境靠图片扫码，非有头窗口。"""
@@ -1096,9 +1789,11 @@ def cmd_login(a) -> int:
 
     qr_out = Path(a.qr_out).expanduser() if a.qr_out else DEFAULT_QR_OUT
     timeout_s = a.timeout or 180
+    community_only = getattr(a, "community_only", False)
     sf = getattr(a, "status_file", None)
+    profile_base = (a.profile_base if a.profile_base is not None else _community_profile_base()) if community_only else a.profile_base
     login_state.write_status(sf, "starting", "正在启动…")
-    lock = _ProfileLock(_profile_dir(a.profile_base))
+    lock = _ProfileLock(_profile_dir(profile_base))
     try:
         lock.acquire(90)
     except TimeoutError:
@@ -1108,40 +1803,40 @@ def cmd_login(a) -> int:
     try:
         with sync_playwright() as p:
             try:
-                ctx = _launch(p, headed=a.headed, base=a.profile_base, proxy=_proxy(a.proxy, a.no_proxy))
+                ctx = _launch(p, headed=a.headed, base=profile_base, proxy=_proxy(a.proxy, a.no_proxy))
             except Exception as e:
                 login_state.write_status(sf, "error", "浏览器没能打开。请关闭弹窗，等 10 秒再点登录，不要连点。")
                 _die(f"启动浏览器失败：{e}", 1)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
-                if _creator_account(ctx) is not None:
+                if community_only:
+                    if _community_identity(ctx):
+                        login_state.write_status(sf, "success", "社区账号已登录")
+                        print("✅ 社区账号身份已确认，无需扫码")
+                        return 0
+                elif _creator_account(ctx) is not None:
                     login_state.write_status(sf, "success", "已登录")
                     print("✅ 已登录（创作平台账号接口已确认），无需扫码")
                     return 0
                 if a.headed:
                     login_state.write_status(
                         sf, "window_login",
-                        "请在弹出的 CloakBrowser 窗口里扫码，不要关掉那个窗口。")
+                        "请在弹出的浏览器窗口里扫码，不要关掉那个窗口。")
                 explore_failed = False
                 try:
                     page.goto(EXPLORE_URL, wait_until="commit", timeout=30000)
                 except Exception as error:
                     explore_failed = True
+                    if community_only:
+                        raise RuntimeError("小红书社区首页无法打开，请检查网络后重试") from None
                     print(f"小红书首页无法打开（{type(error).__name__}），尝试官方创作平台入口",
                           file=sys.stderr)
 
                 # 等待页面稳定并完成可能的跳转（登录引导 / 风险拦截 / 已登录态）
-                for _ in range(0 if explore_failed else 10):
-                    page.wait_for_timeout(800)
-                    if _login_error(page):
-                        break
-                    try:
-                        if _is_logged_in(page):
-                            break
-                    except Exception:
-                        pass
+                if not explore_failed:
+                    _wait_community_login_surface(page)
 
-                if _is_logged_in(page):
+                if not community_only and _is_logged_in(page):
                     login_state.write_status(sf, "success", "已登录")
                     print("✅ 已登录（cookie 已在持久化目录），无需扫码")
                     return 0
@@ -1149,8 +1844,8 @@ def cmd_login(a) -> int:
                 # 抠二维码存 PNG（元素截图，不依赖 src 格式，最稳）
                 qr = False
                 try:
-                    qr = _capture_login_qr(page, qr_out, creator_only=explore_failed)
-                    if not qr:
+                    qr = _capture_login_qr(page, qr_out, creator_only=explore_failed, **({"community_only": True} if community_only else {}))
+                    if not qr and not community_only:
                         login_state.write_status(sf, "success", "已登录")
                         print("✅ 已登录（创作平台登录态已在持久化目录），无需扫码")
                         return 0
@@ -1159,29 +1854,29 @@ def cmd_login(a) -> int:
                         raise
                     login_state.write_status(
                         sf, "window_login",
-                        f"{error}。请在弹出的 CloakBrowser 窗口里完成登录（扫码或短信），不要关掉那个窗口。")
+                        f"{error}。请在弹出的浏览器窗口里完成登录（扫码或短信），不要关掉那个窗口。")
                 if qr:
                     if a.headed:
                         login_state.write_status(
                             sf, "window_login",
-                            "请在弹出的 CloakBrowser 窗口里扫码，不要关掉那个窗口。也可以扫下面这张图。",
+                            "请在弹出的浏览器窗口里扫码，不要关掉那个窗口。也可以扫下面这张图。",
                             qr=str(qr_out))
                     else:
                         login_state.write_status(sf, "qr_ready", "二维码已就绪，请扫码", qr=str(qr_out))
                     print(f"📱 二维码已保存：{qr_out}")
-                    print("   用小红书 App 扫码登录。若走 Easel Web UI，可在 outputs 里查看这张图。")
+                    print("   用小红书 App 扫码登录。若走 xh Web UI，可在 outputs 里查看这张图。")
                     print("   （二维码有时效，约几分钟；过期请重跑 login）")
                 print(f"⏳ 等待扫码确认（最长 {timeout_s}s）...", file=sys.stderr)
 
                 # 轮询登录成功（扫码成功瞬间页面会跳转，查询崩了是正常的，重试继续等）
-                deadline = time.time() + timeout_s
+                deadline = (time.monotonic() if community_only else time.time()) + timeout_s
                 next_refresh = time.monotonic() + 5
                 next_account_check = next_refresh
                 scanned = False
                 refreshes = 0
-                while time.time() < deadline:
+                while (time.monotonic() if community_only else time.time()) < deadline:
                     try:
-                        logged_in = _is_logged_in(page)
+                        logged_in = False if community_only else _is_logged_in(page)
                     except Exception as e:
                         err = str(e).lower()
                         if a.headed and ("target" in err or "closed" in err or "has been closed" in err):
@@ -1193,7 +1888,11 @@ def cmd_login(a) -> int:
                     if state == "scanned" and not scanned:
                         scanned = True
                         login_state.write_status(sf, "scanned", "扫码成功，请在小红书 App 中确认；正在等待登录完成")
-                    if not logged_in and (reason or (
+                    if community_only and time.monotonic() >= next_account_check:
+                        remaining = deadline - time.monotonic()
+                        logged_in = remaining > 0 and _community_identity(ctx, timeout_s=min(6, remaining))
+                        next_account_check = time.monotonic() + 10
+                    if not community_only and not logged_in and (reason or (
                             scanned and time.monotonic() >= next_account_check)):
                         logged_in = _creator_account(ctx) is not None
                         next_account_check = time.monotonic() + 5
@@ -1247,7 +1946,7 @@ def _plan_lines(kind: str, title: str, content: str, media: list[str], tags: lis
     tab = "上传图文" if kind == "image" else "上传视频"
     tl = calc_title_length(title) if title else 0
     lines = [
-        f"发布类型：{kind}    发布页：{PUBLISH_URL}",
+        f"草稿类型：{kind}    编辑页：{PUBLISH_URL}",
         f"标题：{title}（长度 {tl}/{TITLE_MAX}{'  ⚠️超限' if tl > TITLE_MAX else ''}）",
         f"正文：{content[:40]}{'...' if len(content) > 40 else ''}",
         f"媒体：{media}",
@@ -1258,8 +1957,8 @@ def _plan_lines(kind: str, title: str, content: str, media: list[str], tags: lis
         f"  3. {'逐图上传等预览(≤60s/张)' if kind == 'image' else '上传视频等处理(≤10min)'}",
         "  4. 输标题/正文（逐字符）+ 话题联想点选",
         "  5. 平台 DOM 长度校验",
-        "  6. 等发布按钮可点击（新版<xhs-publish-btn>/旧版.bg-red）→ 点击",
-        "  7. 成功校验：URL 离开 /publish/publish",
+        "  6. 唯一可见且可用的「暂存离开/存草稿/保存草稿」按钮 → 点击",
+        "  7. 成功校验：平台明确提示草稿保存成功；缺失即失败，不公开发布",
     ]
     return lines
 
@@ -1274,7 +1973,7 @@ def cmd_plan(a) -> int:
     return 0
 
 
-def _publish(a, kind: str) -> int:
+def _publish_impl(a, kind: str, attempt) -> int:
     if not a.title:
         _die("--title 必填")
     if calc_title_length(a.title) > TITLE_MAX:
@@ -1294,66 +1993,114 @@ def _publish(a, kind: str) -> int:
     content_guard.guard_or_die([a.title, a.content, " ".join(tags)],
                                exec_mode=bool(a.exec),
                                allow_unsafe=getattr(a, "allow_unsafe", False),
-                               label="小红书发布内容")
+                               label="小红书草稿内容")
 
     if not a.exec:
-        print("dry-run（加 --exec 真正发布）：\n")
+        print("dry-run（加 --exec 仅保存平台草稿，不公开发布）：\n")
         for ln in _plan_lines(kind, a.title, a.content or "", media, tags):
             print(ln)
         return 0
 
+    attempt['stage'] = 'runtime'
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     except Exception as e:
-        _die(f"需要 playwright：{e}", 3)
+        attempt['primary_error'] = e
+        _die('需要 Playwright 运行环境，无法启动草稿流程', 3)
+    attempt['stage'] = 'profile_lock'
     lock = _ProfileLock(_profile_dir(a.profile_base))
     try:
         lock.acquire(90)
-    except TimeoutError:
-        _die("小红书登录目录正被占用，请稍后再发")
+    except TimeoutError as error:
+        attempt['primary_error'] = error
+        _die("小红书登录目录正被占用，请稍后再保存草稿")
     try:
+        attempt['stage'] = 'launch'
         with sync_playwright() as p:
-            ctx = _launch(p, headed=a.headed, base=a.profile_base, proxy=_proxy(a.proxy, a.no_proxy))
-            page = ctx.pages[0] if ctx.pages else ctx.new_page()
-            page.set_default_timeout(300000)
             try:
-                page.goto(PUBLISH_URL, wait_until="domcontentloaded")
+                ctx = _launch(p, headed=a.headed, base=a.profile_base, proxy=_proxy(a.proxy, a.no_proxy))
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                attempt['page'] = page
+                page.set_default_timeout(300000)
+            except (Exception, SystemExit) as error:
+                attempt.setdefault('primary_error', error)
+                raise
+            try:
+                attempt['stage'] = 'navigation'
+                try:
+                    page.goto(PUBLISH_URL, wait_until="domcontentloaded")
+                except Exception as error:
+                    _stop_publish_auth(page, login_ok=None, stage='publish_navigation', error=error, attempt=attempt)
                 page.wait_for_timeout(1500)
-                # 登录态探测容忍导航竞态：发布页也可能仍在跳转，跳转瞬间裸 query 会抛
-                # context-destroyed；重试几次再据 url 判定「未登录」，避免误报。
+                attempt['stage'] = 'auth_probe'
+                # Keep failed probe evidence local: unreadable DOM is not an
+                # authenticated negative, even if a later login wall is visible.
                 logged = False
+                probe_error = None
                 for _ in range(4):
-                    if _query_safe(page, SELECTORS["login_ok"]) is not None:
-                        logged = True
-                        break
+                    try:
+                        if page.query_selector(SELECTORS["login_ok"]) is not None:
+                            logged = True
+                            break
+                    except Exception as error:
+                        probe_error = error
                     page.wait_for_timeout(500)
                 if not logged and "login" in page.url.lower():
-                    _die("未登录，请先 `login` 扫码")
+                    _stop_publish_auth(page, login_ok=logged, error=probe_error, attempt=attempt)
+                attempt['stage'] = 'tab'
                 if kind == "image":
                     _click_publish_tab(page, "上传图文")
                     page.wait_for_timeout(1000)
+                    attempt['stage'] = 'upload'
                     _upload_images(page, media)
                 else:
                     _click_publish_tab(page, "上传视频")
                     page.wait_for_timeout(1000)
+                    attempt['stage'] = 'upload'
                     _upload_video(page, media[0])
-                _fill_and_submit(page, a.title, a.content or "", tags)
+                attempt['stage'] = 'fill'
+                _fill_and_save_draft(page, a.title, a.content or "", tags, attempt=attempt)
             except PWTimeout as e:
-                _die(f"步骤超时（选择器可能已失效，检查 SELECTORS）：{e}")
+                attempt['primary_error'] = e
+                _die('小红书草稿步骤超时；请先核对平台草稿，勿重复提交')
+            except (Exception, SystemExit) as error:
+                attempt.setdefault('primary_error', error)
+                raise
             finally:
                 if not a.keep_open:
-                    ctx.close()
+                    try:
+                        ctx.close()
+                    except Exception as error:
+                        _publish_cleanup_error(attempt, error)
     finally:
-        lock.release()
-    # 发布成功 → 落统一内容日历（对话页自动记录；发布页由 web 设 AUTORECORD=0 跳过防重复）
-    try:
-        import calendar_ops
-        calendar_ops.record_publish("xiaohongshu", a.title,
-                                    ptype="视频" if kind == "video" else "图文",
-                                    tags=(a.tags or ""), note=(a.content or ""), source="chat")
-    except Exception:
-        pass
+        try:
+            lock.release()
+        except Exception as error:
+            _publish_cleanup_error(attempt, error)
+    # 草稿不是已发布内容，绝不调用 calendar_ops.record_publish。
+    print(json.dumps({"outcome": "draft_saved", "published": False}, ensure_ascii=False))
     return 0
+
+
+def _publish(a, kind: str) -> int:
+    attempt = {'stage': 'prepare', 'action_sent': False, 'confirmation_sent': False}
+    try:
+        return _publish_impl(a, kind, attempt)
+    except (Exception, SystemExit) as error:
+        primary = attempt.get('primary_error', error)
+        if primary is not error and not isinstance(error, SystemExit):
+            _publish_cleanup_error(attempt, error)
+        if attempt.get('receipt_confirmed'):
+            _publish_cleanup_error(attempt, error)
+            print(json.dumps({'outcome': 'draft_saved', 'published': False}))
+            return 0
+        if not attempt.get('terminal_reported'):
+            _publish_failure(attempt, primary)
+        if isinstance(primary, SystemExit):
+            raise primary
+        if isinstance(error, SystemExit):
+            raise
+        _die('小红书草稿步骤失败；请先核对平台草稿，勿重复提交')
 
 
 def cmd_publish(a) -> int:
@@ -1370,21 +2117,25 @@ def cmd_whoami(a) -> int:
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
-        print(json.dumps({"loggedIn": False, "name": "", "avatar": "", "error": f"playwright:{e}"}))
+        result = {"loggedIn": False, "name": "", "avatar": ""}
+        _whoami_failure(result, 'whoami_import', e, 'XHS_RUNTIME_UNAVAILABLE')
+        print(json.dumps(result))
         return 0
     result = {"loggedIn": False, "name": "", "avatar": ""}
     lock = _ProfileLock(_profile_dir(a.profile_base))
     try:
         lock.acquire(4)
-    except TimeoutError:
-        result["error"] = "profile-busy"
+    except TimeoutError as error:
+        _whoami_failure(result, 'whoami_profile_lock', error, 'XHS_PROFILE_BUSY')
         print(json.dumps(result, ensure_ascii=False))
         return 0
+    stage = 'whoami_launch'
     try:
         with sync_playwright() as p:
             ctx = _launch(p, headed=False, base=a.profile_base, proxy=_proxy(a.proxy, a.no_proxy))
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             try:
+                stage = 'whoami_account'
                 account = _authenticated_account(ctx)
                 if account is not None:
                     result["loggedIn"] = True
@@ -1400,14 +2151,22 @@ def cmd_whoami(a) -> int:
                         except Exception:
                             pass
                 else:
+                    stage = 'whoami_page'
                     logged = _check_account_login(page)
                     result["loggedIn"] = logged
                     if logged:
                         result.update(_page_account_identity(page))
             finally:
-                ctx.close()
-    except Exception as e:  # noqa: BLE001 — whoami 永远输出 JSON，异常视作未登录
-        result["error"] = str(e)
+                if sys.exc_info()[0] is None:
+                    stage = 'whoami_close'
+                    ctx.close()
+                else:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+    except Exception as e:  # noqa: BLE001 — inconclusive diagnostics must not become logout
+        _whoami_failure(result, stage, e)
     finally:
         lock.release()
     print(json.dumps(result, ensure_ascii=False))
@@ -1472,7 +2231,7 @@ def cmd_selftest(_a) -> int:
 def main() -> int:
     login_state.configure_stdio()
     ap = argparse.ArgumentParser(
-        description="小红书发布（Playwright，headless 可用；流程移植自 xiaohongshu-mcp）",
+        description="小红书平台草稿保存（Playwright；执行一律仅保存草稿，不公开发布）",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd")
 
@@ -1484,34 +2243,36 @@ def main() -> int:
     def add_content(p):
         p.add_argument("--title", help="标题（≤20 全角）")
         p.add_argument("--content", help="正文")
-        p.add_argument("--images", help="图片路径，逗号分隔（图文发布）")
-        p.add_argument("--video", help="视频路径（视频发布）")
+        p.add_argument("--images", help="图片路径，逗号分隔（图文草稿）")
+        p.add_argument("--video", help="视频路径（视频草稿）")
         p.add_argument("--tags", help="话题，逗号分隔（如 'AI,教程'）")
-        p.add_argument("--exec", action="store_true", help="真正发布（默认 dry-run）")
+        p.add_argument("--exec", action="store_true", help="实际保存平台草稿（默认 dry-run，不公开发布）")
+        p.add_argument("--draft", action="store_true", default=True, help="显式草稿模式（省略也仅保存草稿）")
         p.add_argument("--allow-unsafe", action="store_true",
-                       help="放行内容安全闸门（检出内部设置泄露也照发，谨慎）")
+                       help="放行草稿内容安全闸门（检出内部设置泄露仍保存，谨慎）")
         p.add_argument("--headed", action="store_true", help="有头模式（首次校验选择器用）")
-        p.add_argument("--keep-open", action="store_true", help="发布后不关浏览器")
+        p.add_argument("--keep-open", action="store_true", help="草稿保存后不关浏览器")
 
     sub.add_parser("check", help="检查 playwright/内核").set_defaults(func=cmd_check)
 
     p = sub.add_parser("login", help="扫码登录并持久化（headless：抠二维码成图片）")
     add_common(p)
+    p.add_argument("--community-only", action="store_true", help="仅确认社区账号登录态")
     p.add_argument("--qr-out", help=f"二维码图片输出路径（默认 {DEFAULT_QR_OUT}）")
     p.add_argument("--status-file", help="登录状态 JSON 输出路径（供 Web 后端轮询）")
     p.add_argument("--timeout", type=int, help="等待扫码超时秒数（默认 180）")
     p.add_argument("--headed", action="store_true", help="有头模式（本地有桌面时可窗口内扫）")
     p.set_defaults(func=cmd_login)
 
-    p = sub.add_parser("plan", help="发布步骤预览（离线）")
+    p = sub.add_parser("plan", help="草稿保存步骤预览（离线）")
     add_content(p)
     p.set_defaults(func=cmd_plan)
 
-    p = sub.add_parser("publish", help="图文发布")
+    p = sub.add_parser("publish", help="图文保存平台草稿")
     add_common(p); add_content(p)
     p.set_defaults(func=cmd_publish)
 
-    p = sub.add_parser("publish-video", help="视频发布")
+    p = sub.add_parser("publish-video", help="视频保存平台草稿")
     add_common(p); add_content(p)
     p.set_defaults(func=cmd_publish_video)
 
