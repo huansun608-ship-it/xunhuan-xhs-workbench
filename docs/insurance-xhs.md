@@ -10,7 +10,7 @@
 
 新增方法文件：标题统一写法与来源取舍、社区标题工作流、开头表达、故事与人话、小红书表达、情绪与观点、学员写稿与改稿、课件方法对应、分类样本、社区图文交流、重疾险表达边界、五份 skill 评审与冲突处理、简介收尾案例库。
 
-新增研究数据包 `assets/research/critical-illness-20261122/`：2026-05-21 至 2026-11-21 窗口内 34 篇正文、其中 26 篇的 120 张本地原图、8 篇深拆与补充 6 篇深读，入口见 [数据索引](../skills/builtin/insurance-xhs/references/critical-illness-data-index.md)。50 篇独立完整近期图文的目标尚未完成，索引中的篇数不等于研究结论。
+新增研究数据包 `skills/builtin/insurance-xhs/assets/research/critical-illness-20261122/`：2026-05-21 至 2026-11-21 窗口内 34 篇正文、其中 26 篇的 120 张本地原图、8 篇深拆与补充 6 篇深读，入口见 [数据索引](../skills/builtin/insurance-xhs/references/critical-illness-data-index.md)。50 篇独立完整近期图文的目标尚未完成，索引中的篇数不等于研究结论。
 
 ## 采集样本与使用边界
 

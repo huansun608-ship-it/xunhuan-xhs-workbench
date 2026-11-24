@@ -29,7 +29,7 @@
 升级包来源为 `insurance-xhs-v1.9.6.zip`，整包解压后覆盖 `skills/builtin/insurance-xhs/`。
 
 - 引用文件：12 个 Markdown → 28 个 Markdown 加 `bio-ending-cases.json`。
-- 新增目录：`assets/research/critical-illness-20261122/`（34 篇正文、26 篇的 120 张原图、8 篇深拆、补充 6 篇深读，另附 manifest 与 checksums）。
+- 新增目录：`skills/builtin/insurance-xhs/assets/research/critical-illness-20261122/`（34 篇正文、26 篇的 120 张原图、8 篇深拆、补充 6 篇深读，另附 manifest 与 checksums）。
 - 新增方法文件：title-writing、title-sources、community-title-workflow、opening-craft、story-and-voice、story-voice-sources、xhs-copy-craft、emotion-and-opinion、student-writing、course-methodology、research-patterns、community-image-posts、critical-illness-craft、critical-illness-data-index、bio-ending-library、integration-review。
 - 两处工作台适配：frontmatter 补 `layer: produce`；源包的 `metadata.version: "1.9.6"` 改为正文首行版本标注，因本仓库 `scripts/validate_skills.py` 只允许 `metadata.openclaw` 形式的 metadata。
 - 已核对：`scripts/validate_skills.py` 通过（115 个技能合规）；全部 29 个引用文件的相对 Markdown 链接零断链；`critical-illness-data-index.md` 指向的 5 个数据文件与 `assets/<note-id>/` 图目录存在。
@@ -37,3 +37,11 @@
 - 采集样本按用户确认随仓库入库，README 的范围声明已同步调整；权利人要求下架时删除对应条目。
 
 `agents/workspace/AGENTS.md` 的保险路由与 `skills/shared/references/insurance-handdrawn-spec.md` 的视觉规则本次未改动，仍按原引用关系生效。
+
+### 2026-11-24：新增 insurance-xhs-proposal
+
+- 位置：`skills/builtin/insurance-xhs-proposal/`，layer 为 plan；不改 insurance-xhs 源包。
+- 用途：一句话需求 → 4 套角度不同的图文方案，每套含真实封面图、标题、封面文案、正文、分项溯源与事实状态；选定后快照、改稿记录、导出。
+- 组合：内容判断仍读 `skills/builtin/insurance-xhs/SKILL.md`；封面走 card-design / card-xiaohongshu，明确手绘时才走 insurance-handdrawn-spec。
+- 登记：`agents/workspace/AGENTS.md` 增加该流程的优先路由；工作区提示需用 `bash agents/sync.sh` 同步到 OpenClaw。
+- 自测：check / render / snapshot / export 全链路通过；4 张测试封面 card_audit 全 PASS。未跑真实发布。
